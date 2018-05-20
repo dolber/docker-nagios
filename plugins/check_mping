@@ -1,0 +1,463 @@
+#! /usr/bin/perl -w
+#
+# Ping of multiple Hosts via icmp protocol
+#
+# Copyright (C) 2009 by Herbert Stadler
+# email: hestadler@gmx.at
+#
+# License Information:
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License 
+# along with this program; if not, see <http://www.gnu.org/licenses/>. 
+#
+#
+#
+############################################################################
+
+
+use POSIX;
+use strict;
+use Getopt::Long;
+
+use lib ".";
+use lib "/usr/lib/nagios/plugins";
+use lib "/usr/lib64/nagios/plugins";
+use lib "/usr/local/nagios/libexec";
+use utils qw(%ERRORS);
+
+my ($opt_version,$opt_help,$opt_verbose);
+my ($opt_timeout,$opt_license);
+my ($opt_hostname,$opt_warn,$opt_crit,$opt_psize);
+my ($opt_ping_timeout,$opt_ohosts,$opt_stop_1st_reached,$opt_ping_count);
+my ($PROGNAME,$REVISION);
+my ($state,$msg);
+
+use constant DEF_TIMEOUT		=>30;
+use constant DEF_P_COUNT		=>3;
+use constant DEF_PACKETSIZE		=>64;
+use constant DEF_P_TIMEOUT		=>5;
+use constant PCOMMAND_LINUX             =>"/bin/ping -c \$count\$ -s \$packetsize\$ -W \$timeout\$  \$destination\$ 2>/dev/null";
+
+$ENV{'PATH'}='';
+$ENV{'BASH_ENV'}=''; 
+$ENV{'ENV'}='';
+$PROGNAME = "check_mping";
+$REVISION = "1.0";
+
+# checking commandline arguments
+my $arg_status = check_args();
+if ($arg_status){
+  print "ERROR: some arguments wrong\n";
+  exit $ERRORS{"UNKNOWN"};
+}
+
+# set alarmhandler for timeout handling
+$SIG{'ALRM'} = sub {
+  print ("ERROR: plugin timed out after $opt_timeout seconds \n");
+  exit $ERRORS{"UNKNOWN"};
+};
+
+alarm($opt_timeout);
+
+# set default values for program exit
+if (defined ($opt_stop_1st_reached)) {
+  $msg = "MPING CRITICAL - No Hosts reached ";
+  $state = $ERRORS{'CRITICAL'};
+} else {
+  $msg = "MPING OK - No Problems found ";
+  $state = $ERRORS{'OK'};
+}
+
+my $l_tmsg;
+
+my @hosts;
+push (@hosts,$opt_hostname);
+if ( defined ($opt_ohosts)) {
+  my @otherhosts=split(",",$opt_ohosts);
+  foreach my $others (@otherhosts) {
+    push (@hosts,$others);
+  }
+}
+
+foreach my $l_hostname (@hosts) {
+  # return value: Round Trip Time in ms
+  my $rtt=Do_Ping($l_hostname);
+
+  if (defined ($opt_stop_1st_reached)) {
+    # if one server was reached than everything is OK
+    if ( $rtt ) { 
+      if ( $opt_verbose ) {
+        printf("RTT %-20s: %.3f ms\n",$l_hostname,$rtt);
+      }
+
+      $state = $ERRORS{'OK'};
+      Set_StatusCode($rtt,$l_hostname);
+
+      last;
+    }
+  } else {
+    # all servers are to ping
+    if ( $rtt ) { 
+      if ( $opt_verbose ) {
+        printf("RTT %-20s: %.3f ms\n",$l_hostname,$rtt);
+      }
+      Set_StatusCode($rtt,$l_hostname);
+    } else {
+      if ( $opt_verbose ) {
+        printf("RTT %-20s: not reached\n",$l_hostname);
+      }
+
+      create_msg(sprintf("%s:nr",$l_hostname));
+      $state = $ERRORS{'CRITICAL'};
+    }
+  }
+}
+
+
+if ($state == $ERRORS{'OK'}){
+  $msg = "MPING OK - ".$l_tmsg 			if ( defined ($l_tmsg));
+}elsif ($state == $ERRORS{'WARNING'}){
+  $msg = "MPING WARNING - ".$l_tmsg;
+}elsif ($state == $ERRORS{'CRITICAL'}){
+  $msg = "MPING CRITICAL - ".$l_tmsg		if ( defined ($l_tmsg));
+}
+
+# and now "over and out"
+
+print "$msg|$l_tmsg\n";
+exit $state;
+
+
+
+
+#--------------------------------------------------------------------------#
+# S U B R O U T I N E S                                                    #
+#--------------------------------------------------------------------------#
+
+#--------------------------------------------------------------------------
+sub Set_StatusCode { 
+#--------------------------------------------------------------------------
+  my ($rtt,$l_hostname)=@_;
+
+  if ($rtt < $opt_warn ) {
+    create_msg(sprintf("%s:%.3f ms",$l_hostname,$rtt));
+  } elsif ( $rtt < $opt_crit) {
+    create_msg(sprintf("%s:%.3f ms",$l_hostname,$rtt));
+    if ( $state != $ERRORS{'CRITICAL'} ) {
+      $state = $ERRORS{'WARNING'};
+    }
+  } else {
+    $state = $ERRORS{'CRITICAL'};
+    create_msg(sprintf("%s:%.3f ms",$l_hostname,$rtt));
+  }
+}
+
+#--------------------------------------------------------------------------
+sub Do_Ping {
+#--------------------------------------------------------------------------
+  my ($l_host)=@_;
+
+  my $PINGCMD=PCOMMAND_LINUX;
+
+  $PINGCMD=~s/\$count\$/$opt_ping_count/;
+  $PINGCMD=~s/\$packetsize\$/$opt_psize/;
+  $PINGCMD=~s/\$timeout\$/$opt_ping_timeout/;
+  $PINGCMD=~s/\$destination\$/$l_host/;
+
+  if ( $opt_verbose ) {
+    printf("Executing Command: %s\n",$PINGCMD);
+  }
+  if (open (INDATA, $PINGCMD . " |") ) {
+    while (<INDATA>) {
+      if ( $opt_verbose ) {
+	printf("%s",$_);
+      }
+      # rtt min/avg/max/mdev = 0.481/0.709/1.160/0.318 ms
+      if(/^rtt min\/avg\/max\/mdev\s+=\s+([.0-9]+)\/([.0-9]+)\/([.0-9]+)\/([.0-9]+)\s+ms/){
+	my $avg=$2;
+	if ( $opt_verbose ) {
+	  printf("Average RTT: %.3f\n",$avg);
+	}
+	return ($avg);
+      }
+    }
+    close(INDATA);
+  }
+  return (undef);
+}
+
+#--------------------------------------------------------------------------
+sub create_msg {
+#--------------------------------------------------------------------------
+  my ($l_txt)=@_;
+
+  if (! defined $l_txt) {return};
+
+  if (defined $l_tmsg) {
+    $l_tmsg.=",";
+  }
+  $l_tmsg.=$l_txt;
+}
+
+#--------------------------------------------------------------------------
+sub check_args {
+#--------------------------------------------------------------------------
+  Getopt::Long::Configure('bundling');
+  GetOptions
+	("V"   			=> \$opt_version,
+	 "version"   		=> \$opt_version,
+	 "L"   			=> \$opt_license, 
+	 "license"   		=> \$opt_license, 
+	 "v"   			=> \$opt_verbose, 
+	 "verbose"   		=> \$opt_verbose, 
+	 "h|?" 			=> \$opt_help,
+	 "help"   		=> \$opt_help,
+	 "s" 			=> \$opt_stop_1st_reached,
+	 "stop1st"   		=> \$opt_stop_1st_reached,
+	 "t=i" 			=> \$opt_timeout, 
+	 "timeout=i" 		=> \$opt_timeout, 
+	 "H=s" 			=> \$opt_hostname, 
+	 "hostname=s" 		=> \$opt_hostname, 
+	 "o=s" 			=> \$opt_ohosts, 
+	 "ohostname=s" 		=> \$opt_ohosts, 
+	 "w=i" 			=> \$opt_warn, 
+	 "warning=i" 		=> \$opt_warn, 
+	 "c=i" 			=> \$opt_crit, 
+	 "critical=i" 		=> \$opt_crit, 
+	 );
+
+  if ($opt_license) {
+    print_gpl($PROGNAME,$REVISION);
+    exit $ERRORS{'OK'};
+  }
+
+  if ($opt_version) {
+    print_revision($PROGNAME,$REVISION);
+    exit $ERRORS{'OK'};
+  }
+
+  if ($opt_help) {
+    print_help();
+    exit $ERRORS{'OK'};
+  }
+
+  if ( ! defined($opt_hostname)){
+    print "\nERROR: Hostname not defined\n\n";
+    print_usage();
+    exit $ERRORS{'UNKNOWN'};
+  }
+
+  unless (defined $opt_warn) {
+    print "\nERROR: Parameter WARNING not defined\n\n";
+    print_usage();
+    exit $ERRORS{'UNKNOWN'};
+  }
+
+  unless (defined $opt_crit) {
+    print "\nERROR: Parameter CRITICAL not defined\n\n";
+    print_usage();
+    exit $ERRORS{'UNKNOWN'};
+  }
+  if ( $opt_warn >= $opt_crit ) {
+    print "\nERROR: Parameter WARN greater than parameter CRIT\n\n";
+    print_usage();
+    exit $ERRORS{'UNKNOWN'};
+  }
+
+  unless (defined $opt_timeout) {
+    $opt_timeout = DEF_TIMEOUT;
+  }
+
+  $opt_psize        =DEF_PACKETSIZE;
+  $opt_ping_timeout =DEF_P_TIMEOUT;
+  $opt_ping_count   =DEF_P_COUNT;
+
+  return $ERRORS{'OK'};
+}
+
+#--------------------------------------------------------------------------
+sub print_usage {
+#--------------------------------------------------------------------------
+  print "Usage: $PROGNAME [-h] [-s] [-L] [-t timeout] [-v] [-V] -H hostname -w warn_rtt_ms -c crit_rtt_ms [-o hostname1[,hostname2]] \n\n";
+}
+
+#--------------------------------------------------------------------------
+sub print_help {
+#--------------------------------------------------------------------------
+  print_revision($PROGNAME,$REVISION);
+  print_usage();
+  printf ("   Multi Destination Pinger, pinging a list of hosts \n");
+  printf ("-t (--timeout)      Timeout in seconds (default=%d)\n",DEF_TIMEOUT);
+  printf ("-H (--hostname)     Hostname to monitor\n");
+  printf ("-o (--ohostname)    Additional hostnames to monitor\n");
+  printf ("                    example: -o hostname1,hostname2\n");
+  printf ("-h (--help)         Help\n");
+  printf ("-V (--version)      Programm version\n");
+  printf ("-v (--verbose)      Print some useful information\n");
+  printf ("-L (--license)      Print license information\n");
+  printf ("-w (--warning)      Warning threshold round trip time (in ms)\n");
+  printf ("-c (--critical)     Critical threshold round trip time (in ms)\n");
+  printf ("-s (--stop1st)      Stop pinging if one server was reached -> status OK\n");
+  printf ("\n");
+}
+
+
+#--------------------------------------------------------------------------
+sub print_gpl {
+#--------------------------------------------------------------------------
+  print <<EOD;
+
+  Copyright (C) 2009 by Herbert Stadler
+  email: hestadler\@gmx.at
+
+  License Information:
+  This program is free software; you can redistribute it and/or modify
+  it under the terms of the GNU General Public License as published by
+  the Free Software Foundation; either version 3 of the License, or
+  (at your option) any later version.
+ 
+  This program is distributed in the hope that it will be useful,
+  but WITHOUT ANY WARRANTY; without even the implied warranty of
+  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+  GNU General Public License for more details.
+ 
+  You should have received a copy of the GNU General Public License 
+  along with this program; if not, see <http://www.gnu.org/licenses/>. 
+
+EOD
+
+}
+
+#--------------------------------------------------------------------------
+sub print_revision {
+#--------------------------------------------------------------------------
+  my ($l_prog,$l_revision)=@_;
+
+  print <<EOD
+
+$l_prog $l_revision, Copyright (C) 2009 Herbert Stadler
+
+This program comes with ABSOLUTELY NO WARRANTY; 
+for details type "$l_prog -L".
+
+EOD
+}
+
+
+
+=head1 NAME
+
+ check_mping
+
+=head1 DESCRIPTION
+
+ Multi Ping
+
+ Useful to monitor VPN-Connections (Network-Tunnels) if the linkage is 
+ up & running between the 2 locations.
+
+ If the servers on "the other side" are not always 100% reachable,
+ therefore more than 1 server are possible to ping.
+
+ Plugin created for Nagios Monitoring.
+
+=head1 SYNOPSIS
+
+ check_mping -h
+
+ for more information concerning this plugin call:
+     check_mping -h
+     perldoc check_mping
+
+ Description of Parameters:
+  -t (--timeout)   Timeout in seconds
+
+  -H (--hostname)  Hostname to monitor
+
+  -o (--ohostname) additional hostnames to monitor
+
+  -h (--help)      Help
+
+  -V (--version)   Programm version
+
+  -v (--verbose)   Print some useful information
+
+  -L (--license)   Print license information
+
+  -w (--warning)   Warning threshold round trip time
+
+  -c (--critical)  Critical threshold round trip time
+
+  -s (--stop1st)   Stops pinging if one server in the list was reachable
+                   If one server in the list is reached then pinging 
+                   stops and RC = OK.
+
+                   If no server was reached then RC = CRITICAL.
+
+                   Definitions of parameter -w -c (RTT thresholds) 
+                   are ignored.
+
+                   WARNING not possible (only OK or CRITICAL).
+
+=head1 AUTHOR
+
+ Herbert Stadler, Austria (hestadler@gmx.at)
+ May 2009
+
+ This plugin is a contribution to the nagios community.
+
+=head1 REQUIRED SOFTWARE
+
+ 
+
+=head1 CONFIGURATION IN NAGIOS
+
+ Copy this plugin to the nagios plugin installation directory 
+ e.g.: /usr/lib(64)/nagios/plugin
+
+ COMMAND DEFINITION:
+
+ # "check_mping" command definition
+ define command{
+    command_name    check_mping
+    command_line    $USER1$/check_mping -H $HOSTADDRESS$ -o otherhost1,otherhost2 -w 100 -c 200
+    }
+
+
+=head1 PLUGIN HISTORY
+
+ Version 1.0 - 2009-05-05	first release
+
+=head1 COPYRIGHT AND DISCLAIMER
+
+ Copyright (C) 2009 by Herbert Stadler
+ email: hestadler@gmx.at
+
+ License Information:
+ This program is free software; you can redistribute it and/or modify
+ it under the terms of the GNU General Public License as published by
+ the Free Software Foundation; either version 3 of the License, or
+ (at your option) any later version.
+ 
+ This program is distributed in the hope that it will be useful,
+ but WITHOUT ANY WARRANTY; without even the implied warranty of
+ MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ GNU General Public License for more details.
+ 
+ You should have received a copy of the GNU General Public License 
+ along with this program; if not, see <http://www.gnu.org/licenses/>. 
+ 
+
+=cut
+
+
+
